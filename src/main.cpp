@@ -7,7 +7,9 @@
 
 // --- Hardware Configuration ---
 #define PIN_PPG 26      // Analog Input for Pulse Sensor (G26 - Header)
-#define PIN_LED 33      // GPIO for LED Matrix (G33 - Grove Yellow Wire)
+// Unit Puzzle Signal: Try both G32 (White) and G33 (Yellow) to be sure
+#define PIN_LED_A 32    
+#define PIN_LED_B 33
 #define NUM_LEDS 64     // 8x8 Matrix
 
 // --- Algorithm Constants ---
@@ -77,15 +79,17 @@ void setup() {
 
     pinMode(PIN_PPG, INPUT);
     
-    // Explicitly set LED pin to Output and Low before Init
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
+    // Explicitly set LED pins to Output and Low
+    pinMode(PIN_LED_A, OUTPUT); digitalWrite(PIN_LED_A, LOW);
+    pinMode(PIN_LED_B, OUTPUT); digitalWrite(PIN_LED_B, LOW);
 
-    // Init FastLED 
-    // M5StickC Plus Grove: G32 (Yellow Line) is standard for Signal.
-    // Use WS2812B definition as it's robust for SK6812 too usually.
-    FastLED.addLeds<WS2812, PIN_LED, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-    FastLED.setBrightness(40); 
+    // Init FastLED - Output to BOTH G32 and G33 (Redundancy)
+    // Use WS2812 which is compatible with WS2812E
+    FastLED.addLeds<WS2812, PIN_LED_A, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<WS2812, PIN_LED_B, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+    
+    // Safety Brightness (Low power start)
+    FastLED.setBrightness(10); 
     
     // LED Test: Red, Green, Blue Flash
     M5.Lcd.print("\nTEST: R");
