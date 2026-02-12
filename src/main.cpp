@@ -102,7 +102,7 @@ void setup() {
     // Intro
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(10, 30);
-    M5.Lcd.print("AII Monitor");
+    M5.Lcd.print("Fluct Monitor");
     
     // Check Storage
     if(SPIFFS.exists(logFileName)) {
