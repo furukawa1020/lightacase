@@ -1,9 +1,9 @@
-#include <M5StickCPlus.h>
-#include <FastLED.h>
 #include <vector>
 #include <numeric>
 #include <deque>
 #include <cmath>
+#include <M5StickCPlus.h>
+#include <FastLED.h>
 
 // --- Hardware Configuration ---
 #define PIN_PPG 26      // Analog Input for Pulse Sensor (G26 - Header)
