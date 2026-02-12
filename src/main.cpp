@@ -40,6 +40,7 @@ int signalMin = 4095;
 int signalMax = 0;
 unsigned long lastBeatTime = 0;
 bool pulseState = false;
+bool isFingerPresent = false; // Detection flag
 int lastIBI = 0;
 int pulseAmplitude = 0;
 
@@ -136,9 +137,19 @@ void loop() {
 }
 
 void updateLEDs() {
+    // Check if we have a valid finger signal
+    // If invalid, force targetAreaA to 0 (Calm/Green) quickly
+    if (!isFingerPresent) {
+        targetAreaA = 0;
+        // Faster decay when finger is removed for immediate feedback
+        currentAreaDisp = (0.2f * 0.0f) + (0.8f * currentAreaDisp);
+    } else {
+        // Normal inertia
+        currentAreaDisp = (ALPHA * (float)targetAreaA) + ((1.0f - ALPHA) * currentAreaDisp);
+    }
+
     // Inertia Filter Step (200ms)
     // A_disp(t) = a * A(t) + (1-a) * A_disp(t-1)
-    currentAreaDisp = (ALPHA * (float)targetAreaA) + ((1.0f - ALPHA) * currentAreaDisp);
     
     int numActive = (int)currentAreaDisp;
     // Safety clamp (Display can only do 64)
@@ -221,8 +232,22 @@ void drawWaveform() {
 
 void processPPG() {
     analogSignal = analogRead(PIN_PPG);
-    if (analogSignal < 1) analogSignal = 0;
     
+    // Safety caps
+    if (analogSignal < 1) analogSignal = 0;
+    if (analogSignal > 4095) analogSignal = 4095;
+    
+    // --- Finger Detection / Validity Check ---
+    // 1. DC Signal Check: 
+    //    Open air is usually approx 0 (if pull-down) or floating.
+    //    Pulse Sensor via M5Stick is usually around 0 when floating.
+    //    Finger should pull it up to > 1000 typically (depends on VCC).
+    //    We use > 300 as a loose floor for "Something is there".
+    // 2. Saturation Check:
+    //    If > 4000, it's railed. Can't read pulses reliably.
+    bool dcOk = (analogSignal > 300 && analogSignal < 4000);
+    
+    // Decay for dynamic range
     if (signalMax > signalMin) {
         signalMax -= 2; 
         signalMin += 2; 
@@ -237,10 +262,19 @@ void processPPG() {
     pulseAmplitude = signalMax - signalMin;
     threshold = signalMin + (pulseAmplitude / 2);
 
+    // 3. AC Amplitude Check:
+    //    Static objects (tables, walls) have Constant DC, so Amplitude is tiny (<20).
+    //    Human pulse is usually > 50-100.
+    bool acOk = (pulseAmplitude > 50);
+
+    // Final Decision
+    isFingerPresent = (dcOk && acOk);
+
     unsigned long now = millis();
     int ibi = 0;
     
-    if (pulseAmplitude > 100) { 
+    // Only detect beats if signal is valid
+    if (isFingerPresent && pulseAmplitude > 100) { 
         if (analogSignal > threshold && !pulseState) {
             if (now - lastBeatTime > 250) { 
                 pulseState = true;
@@ -259,6 +293,13 @@ void processPPG() {
             }
         } else if (analogSignal < threshold && pulseState) {
             pulseState = false;
+        }
+    } else {
+        // Reset state checks if frequent noise
+        if (now - lastBeatTime > 2000) {
+           pulseState = false;
+           // Don't clear IBI buffer immediately to handle short drops
+           // But if no finger for 2s, we can assume restart.
         }
     }
 
