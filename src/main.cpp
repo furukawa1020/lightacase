@@ -202,7 +202,8 @@ void logToStorage(unsigned long t, float r, float d, float v, float f, float a, 
 }
 
 void dumpData() {
-    Serial.println("\n--- DATA START ---");
+    // --- Pass 1: CSV ---
+    Serial.println("\n--- CSV START ---");
     if(SPIFFS.exists(logFileName)){
         File f = SPIFFS.open(logFileName, FILE_READ);
         while(f.available()){
@@ -211,8 +212,58 @@ void dumpData() {
         f.close();
     } else {
         Serial.println("No Log File");
+        return;
     }
-    Serial.println("\n--- DATA END ---");
+    Serial.println("--- CSV END ---");
+
+    // --- Pass 2: JSON ---
+    Serial.println("\n--- JSON START ---");
+    Serial.println("[");
+    if(SPIFFS.exists(logFileName)){
+        File f = SPIFFS.open(logFileName, FILE_READ);
+        if(f) {
+            String line = f.readStringUntil('\n'); // Skip Header
+            bool firstEntry = true;
+            
+            while(f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if(line.length() == 0) continue;
+                
+                // Parse CSV line
+                // Format: time,rmssd,d,v,f,a,amp,ibi
+                int p1 = line.indexOf(',');
+                int p2 = line.indexOf(',', p1+1);
+                int p3 = line.indexOf(',', p2+1);
+                int p4 = line.indexOf(',', p3+1);
+                int p5 = line.indexOf(',', p4+1);
+                int p6 = line.indexOf(',', p5+1);
+                int p7 = line.indexOf(',', p6+1);
+                
+                if(p7 == -1) continue; // Invalid line
+                
+                String s_time = line.substring(0, p1);
+                String s_rmssd = line.substring(p1+1, p2);
+                String s_d = line.substring(p2+1, p3);
+                String s_v = line.substring(p3+1, p4);
+                String s_f = line.substring(p4+1, p5);
+                String s_a = line.substring(p5+1, p6);
+                String s_amp = line.substring(p6+1, p7);
+                String s_ibi = line.substring(p7+1);
+
+                if(!firstEntry) Serial.println(",");
+                
+                Serial.printf("  {\"t\":%s,\"rmssd\":%s,\"d\":%s,\"v\":%s,\"f\":%s,\"a\":%s,\"amp\":%s,\"ibi\":%s}", 
+                    s_time.c_str(), s_rmssd.c_str(), s_d.c_str(), s_v.c_str(), 
+                    s_f.c_str(), s_a.c_str(), s_amp.c_str(), s_ibi.c_str());
+                
+                firstEntry = false;
+            }
+            f.close();
+        }
+    }
+    Serial.println("\n]");
+    Serial.println("--- JSON END ---");
 }
 
 void clearData() {
