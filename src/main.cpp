@@ -2,6 +2,7 @@
 #include <numeric>
 #include <deque>
 #include <cmath>
+#include <SPIFFS.h>
 
 #include <M5StickCPlus.h>
 #undef min
@@ -10,7 +11,7 @@
 
 // --- Hardware ---
 #define PIN_PPG 26     
-#define PIN_LED 33    // Trying G33 as requested previously
+#define PIN_LED 33    
 #define NUM_LEDS 64    
 
 // --- Config ---
@@ -27,7 +28,6 @@ const unsigned long DISPLAY_INTERVAL_MS = 200;
 // --- Globals ---
 Adafruit_NeoPixel pixels(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
 
-// We store the colors here
 std::vector<uint32_t> virtualLeds(NUM_LEDS, 0);
 
 unsigned long lastSampleTime = 0;
@@ -40,7 +40,7 @@ int signalMin = 4095;
 int signalMax = 0;
 unsigned long lastBeatTime = 0;
 bool pulseState = false;
-bool isFingerPresent = false; // Detection flag
+bool isFingerPresent = false; 
 int lastIBI = 0;
 int pulseAmplitude = 0;
 
@@ -60,8 +60,8 @@ float metricF = 0.0f;
 float metricS = 0.0f;
 
 // Area Control
-int targetAreaA = 0;      // calculated A(t)
-float currentAreaDisp = 0.0f; // smoothed A_disp(t)
+int targetAreaA = 0;      
+float currentAreaDisp = 0.0f; 
 
 // Display Config
 #define GRAPH_WIDTH 150
@@ -69,11 +69,12 @@ float currentAreaDisp = 0.0f; // smoothed A_disp(t)
 #define GRAPH_Y_OFFSET 0
 
 #define MATRIX_X_OFFSET 155
-#define MATRIX_Y_OFFSET 27 // Centered vertically in 135 height (roughly)
+#define MATRIX_Y_OFFSET 27 
 #define CELL_SIZE 10
 
 int waveformBuffer[GRAPH_WIDTH]; 
 int waveIdx = 0;
+String logFileName = "/data.csv";
 
 // --- Prototypes ---
 void processPPG(); 
@@ -83,9 +84,14 @@ float calculateRMSSD();
 float calculateVariance();
 void drawWaveform();
 void drawVirtualMatrix();
+void logToStorage(unsigned long t, float r, float d, float v, float f, float a, int amp, int ibi);
+void dumpData();
+void clearData();
 
 void setup() {
-    M5.begin();
+    M5.begin(); // internal Serial.begin(115200) called
+    SPIFFS.begin(true); // Mount SPIFFS, format if fail
+    
     M5.Lcd.setRotation(3);
     M5.Lcd.setTextSize(2);
     
@@ -95,16 +101,56 @@ void setup() {
 
     // Intro
     M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.setCursor(10, 30);
     M5.Lcd.print("AII Monitor");
-    delay(1000);
-    M5.Lcd.fillScreen(BLACK);
     
-    // Draw Static Frames
+    // Check Storage
+    if(SPIFFS.exists(logFileName)) {
+        M5.Lcd.setCursor(10, 60);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.print("Log Found: BtnA to Dump");
+        M5.Lcd.setCursor(10, 75);
+        M5.Lcd.print("BtnB to Clear/Start");
+    } else {
+        M5.Lcd.setCursor(10, 60);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.print("BtnB to Start New Log");
+    }
+    
+    bool waiting = true;
+    while(waiting) {
+        M5.update();
+        if(M5.BtnA.wasPressed()) {
+            dumpData();
+            // Don't start measurement yet
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(10, 60);
+            M5.Lcd.print("Dump Done. BtnB to Start");
+        }
+        if(M5.BtnB.wasPressed()) {
+            clearData();
+            waiting = false;
+        }
+        delay(10);
+    }
+    
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10, 50); M5.Lcd.setTextSize(2);
+    M5.Lcd.print("Starting...");
+    delay(500);
+    
+    // Setup Layout
+    M5.Lcd.fillScreen(BLACK);
     M5.Lcd.drawRect(MATRIX_X_OFFSET - 2, MATRIX_Y_OFFSET - 2, (8*CELL_SIZE)+4, (8*CELL_SIZE)+4, WHITE);
 
     pinMode(PIN_PPG, INPUT);
-    Serial.begin(115200);
+    // Print Header
+    Serial.println("timestamp_ms,RMSSD_sec,D,V,F,A_disp,Amp,IBI_ms");
+    File f = SPIFFS.open(logFileName, FILE_APPEND);
+    if(f) {
+        f.println("timestamp_ms,RMSSD_sec,D,V,F,A_disp,Amp,IBI_ms");
+        f.close();
+    }
 
     for(int i=0; i<GRAPH_WIDTH; i++) waveformBuffer[i] = GRAPH_HEIGHT / 2;
 }
@@ -112,6 +158,17 @@ void setup() {
 void loop() {
     M5.update();
     unsigned long now = millis();
+    
+    // Button Checks during run
+    if (M5.BtnA.wasPressed()) {
+        // Pause and Dump? Or just mark?
+        // Usually better to stop and dump.
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(10,10); M5.Lcd.print("PAUSED: Dumping...");
+        dumpData();
+        M5.Lcd.fillScreen(BLACK); // Resume
+        M5.Lcd.drawRect(MATRIX_X_OFFSET - 2, MATRIX_Y_OFFSET - 2, (8*CELL_SIZE)+4, (8*CELL_SIZE)+4, WHITE);
+    }
 
     // 1. Sampling (100Hz)
     if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
@@ -127,7 +184,6 @@ void loop() {
     }
 
     // 2. Display (5Hz)
-    // Runs inertia filter and rendering
     if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
         lastDisplayTime = now;
         updateLEDs(); 
@@ -136,37 +192,53 @@ void loop() {
     }
 }
 
+void logToStorage(unsigned long t, float r, float d, float v, float f, float a, int amp, int ibi) {
+    // Write to SPIFFS
+    File file = SPIFFS.open(logFileName, FILE_APPEND);
+    if(file){
+        file.printf("%lu,%.4f,%.4f,%.6f,%.4f,%.0f,%d,%d\n", t, r, d, v, f, a, amp, ibi);
+        file.close();
+    }
+}
+
+void dumpData() {
+    Serial.println("\n--- DATA START ---");
+    if(SPIFFS.exists(logFileName)){
+        File f = SPIFFS.open(logFileName, FILE_READ);
+        while(f.available()){
+            Serial.write(f.read());
+        }
+        f.close();
+    } else {
+        Serial.println("No Log File");
+    }
+    Serial.println("\n--- DATA END ---");
+}
+
+void clearData() {
+    SPIFFS.remove(logFileName);
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10,50);
+    M5.Lcd.print("Log Cleared");
+    delay(500);
+}
+
 void updateLEDs() {
-    // Check if we have a valid finger signal
-    // If invalid, force targetAreaA to 0 (Calm/Green) quickly
     if (!isFingerPresent) {
         targetAreaA = 0;
-        // Faster decay when finger is removed for immediate feedback
         currentAreaDisp = (0.2f * 0.0f) + (0.8f * currentAreaDisp);
     } else {
-        // Normal inertia
         currentAreaDisp = (ALPHA * (float)targetAreaA) + ((1.0f - ALPHA) * currentAreaDisp);
     }
-
-    // Inertia Filter Step (200ms)
-    // A_disp(t) = a * A(t) + (1-a) * A_disp(t-1)
     
     int numActive = (int)currentAreaDisp;
-    // Safety clamp (Display can only do 64)
     if (numActive > 64) numActive = 64;
 
-    // Colors
-    // Green: Calm. HSV(120, low sat, low val) -> approximated
     uint32_t cBase = pixels.Color(0, 10, 0);   
-    
-    // Red: HSV(0, 80%, 80%) -> R=204, G=41, B=41 ( approx for WS2812)
-    // M5 "Red" (255,0,0) is fine but let's make it slightly less saturated as requested?
-    // User: HSV(0, 80%, 80%) = approx RGB(204, 40, 40)
     uint32_t cRed  = pixels.Color(200, 40, 40); 
 
     std::fill(virtualLeds.begin(), virtualLeds.end(), cBase);
 
-    // Random Red Dots
     std::vector<int> indices(NUM_LEDS);
     std::iota(indices.begin(), indices.end(), 0);
     
@@ -207,7 +279,7 @@ void drawWaveform() {
     M5.Lcd.printf("HRV:%.0f ms", currentRMSSD);
     
     M5.Lcd.setCursor(0, 15); 
-    M5.Lcd.printf("F:%.2f", metricF); // Show F(t)
+    M5.Lcd.printf("F:%.2f", metricF); 
 
     M5.Lcd.setCursor(80, 5); 
     M5.Lcd.printf("Area:%d", (int)currentAreaDisp);
@@ -226,28 +298,16 @@ void drawWaveform() {
         int nextIdx = (waveIdx + i + 1) % GRAPH_WIDTH;
         M5.Lcd.drawLine(i, waveformBuffer[idx], i+1, waveformBuffer[nextIdx], GREEN);
     }
-    
     M5.Lcd.drawFastVLine(GRAPH_WIDTH + 2, 0, 135, WHITE);
 }
 
 void processPPG() {
     analogSignal = analogRead(PIN_PPG);
-    
-    // Safety caps
     if (analogSignal < 1) analogSignal = 0;
     if (analogSignal > 4095) analogSignal = 4095;
     
-    // --- Finger Detection / Validity Check ---
-    // 1. DC Signal Check: 
-    //    Open air is usually approx 0 (if pull-down) or floating.
-    //    Pulse Sensor via M5Stick is usually around 0 when floating.
-    //    Finger should pull it up to > 1000 typically (depends on VCC).
-    //    We use > 300 as a loose floor for "Something is there".
-    // 2. Saturation Check:
-    //    If > 4000, it's railed. Can't read pulses reliably.
     bool dcOk = (analogSignal > 300 && analogSignal < 4000);
     
-    // Decay for dynamic range
     if (signalMax > signalMin) {
         signalMax -= 2; 
         signalMin += 2; 
@@ -262,18 +322,12 @@ void processPPG() {
     pulseAmplitude = signalMax - signalMin;
     threshold = signalMin + (pulseAmplitude / 2);
 
-    // 3. AC Amplitude Check:
-    //    Static objects (tables, walls) have Constant DC, so Amplitude is tiny (<20).
-    //    Human pulse is usually > 50-100.
     bool acOk = (pulseAmplitude > 50);
-
-    // Final Decision
     isFingerPresent = (dcOk && acOk);
 
     unsigned long now = millis();
     int ibi = 0;
     
-    // Only detect beats if signal is valid
     if (isFingerPresent && pulseAmplitude > 100) { 
         if (analogSignal > threshold && !pulseState) {
             if (now - lastBeatTime > 250) { 
@@ -283,9 +337,6 @@ void processPPG() {
                      if (ibi > 300 && ibi < 1500) { 
                          ibiBuffer.push_back({now, ibi});
                          lastIBI = ibi;
-                         
-                         // *** CRITICAL CHANGE ***
-                         // Update metrics ON BEAT event to capture the 'Jump'
                          calculateMetrics(); 
                      }
                 }
@@ -295,11 +346,8 @@ void processPPG() {
             pulseState = false;
         }
     } else {
-        // Reset state checks if frequent noise
         if (now - lastBeatTime > 2000) {
            pulseState = false;
-           // Don't clear IBI buffer immediately to handle short drops
-           // But if no finger for 2s, we can assume restart.
         }
     }
 
@@ -335,31 +383,22 @@ void calculateMetrics() {
     float rmssdSec = newRMSSD / 1000.0f; 
     float lastRmssdSec = currentRMSSD / 1000.0f; 
     
-    // D: absolute difference of RMSSD (fluctuation of fluctuation)
     metricD = fabs(rmssdSec - lastRmssdSec);
     
     rmssdSecHistory.push_back(rmssdSec);
     if (rmssdSecHistory.size() > VAR_WINDOW) rmssdSecHistory.pop_front();
     
     metricV = calculateVariance();
-    
-    // F: D + Lambda * V
     metricF = metricD + (LAMBDA * metricV);
-    
-    // S: 0.0 - 1.0 Stress Index
-    // S = 1 - e^(-K * F)
     metricS = 1.0f - exp(-K_PARAM * metricF);
     
-    // A(t) = floor(64 * s(t))
-    // User requested max 56
     int rawArea = floor(64.0f * metricS);
     if (rawArea > 56) rawArea = 56;
-    
-    // Update target for the inertia filter
     targetAreaA = rawArea;
-    
     currentRMSSD = newRMSSD; 
     
+    // Log
     Serial.printf("%lu,%.4f,%.4f,%.6f,%.4f,%.0f,%d,%d\n", 
         millis(), rmssdSec, metricD, metricV, metricF, currentAreaDisp, pulseAmplitude, lastIBI);
+    logToStorage(millis(), rmssdSec, metricD, metricV, metricF, currentAreaDisp, pulseAmplitude, lastIBI);
 }
