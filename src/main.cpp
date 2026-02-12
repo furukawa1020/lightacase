@@ -2,14 +2,20 @@
 #include <numeric>
 #include <deque>
 #include <cmath>
+
+// Include M5StickCPlus and NeoPixel after standard libs to prevent macro conflicts
 #include <M5StickCPlus.h>
-#include <FastLED.h>
+// Clear min/max macros if M5 polluted them
+#undef min
+#undef max
+#include <Adafruit_NeoPixel.h>
 
 // --- Hardware Configuration ---
 #define PIN_PPG 26      // Analog Input for Pulse Sensor (G26 - Header)
-// Unit Puzzle Signal: Try both G32 (White) and G33 (Yellow) to be sure
-#define PIN_LED_A 32    
-#define PIN_LED_B 33
+// Unit Puzzle usually uses the White wire for Data Input on Port B/C devices.
+// On M5StickC Plus Grove Port (Port A/Red): White wire is G32, Yellow is G33.
+// We will drive G32. If this fails, user can try changing this to 33.
+#define PIN_LED 32      
 #define NUM_LEDS 64     // 8x8 Matrix
 
 // --- Algorithm Constants ---
@@ -24,7 +30,9 @@ const unsigned long SAMPLE_INTERVAL_MS = 10; // 100Hz
 const unsigned long DISPLAY_INTERVAL_MS = 200;
 
 // --- Globals ---
-CRGB leds[NUM_LEDS];
+// NEO_GRB + NEO_KHZ800 is standard for WS2812/SK6812 (Unit Puzzle)
+Adafruit_NeoPixel pixels(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
+
 unsigned long lastSampleTime = 0;
 unsigned long lastDisplayTime = 0;
 
@@ -72,60 +80,79 @@ void setup() {
     M5.Lcd.setRotation(3);
     M5.Lcd.setTextSize(2);
     M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.print("Init LED...");
+    M5.Lcd.print("Init NeoPixel on G32");
     
-    // Safety delay
-    delay(100);
+    // Power management for Grove logic if needed (StickC Plus sometimes needs 5V boost enablement)
+    // M5.begin() enables Axp.ScreenBreath(11) etc.
+    // Ensure the Grove port has power.
+    
+    // Force Pin 33 (Yellow) to Input or High-Z just to be safe it's not interfering
+    pinMode(33, INPUT);
 
-    pinMode(PIN_PPG, INPUT);
+    // Init NeoPixel
+    pixels.begin();
+    pixels.setBrightness(20); // Low brightness allowed
+    pixels.clear(); 
+    pixels.show(); // Initialize all pixels to 'off'
     
-    // Explicitly set LED pins to Output and Low
-    pinMode(PIN_LED_A, OUTPUT); digitalWrite(PIN_LED_A, LOW);
-    pinMode(PIN_LED_B, OUTPUT); digitalWrite(PIN_LED_B, LOW);
-
-    // Init FastLED - Output to BOTH G32 and G33 (Redundancy)
-    // Use WS2812 which is compatible with WS2812E
-    FastLED.addLeds<WS2812, PIN_LED_A, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-    FastLED.addLeds<WS2812, PIN_LED_B, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-    
-    // Safety Brightness (Low power start)
-    FastLED.setBrightness(10); 
-    
-    // LED Test: Red, Green, Blue Flash
+    // LED Test: Red, Green, Blue Flash sequence 
+    // This is CRITICAL for user verification
     M5.Lcd.print("\nTEST: R");
-    fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show(); delay(300);
-    M5.Lcd.print("G");
-    fill_solid(leds, NUM_LEDS, CRGB::Green); FastLED.show(); delay(300);
-    M5.Lcd.print("B");
-    fill_solid(leds, NUM_LEDS, CRGB::Blue); FastLED.show(); delay(300);
-    FastLED.clear(); FastLED.show();
+    for(int i=0; i<NUM_LEDS; i++) pixels.setPixelColor(i, pixels.Color(100, 0, 0));
+    pixels.show(); delay(500);
+    
+    M5.Lcd.print(" G");
+    for(int i=0; i<NUM_LEDS; i++) pixels.setPixelColor(i, pixels.Color(0, 100, 0));
+    pixels.show(); delay(500);
+    
+    M5.Lcd.print(" B");
+    for(int i=0; i<NUM_LEDS; i++) pixels.setPixelColor(i, pixels.Color(0, 0, 100));
+    pixels.show(); delay(500);
+    
+    pixels.clear(); 
+    pixels.show();
     M5.Lcd.print(" Done");
     delay(500);
+    
+    // Draw initial UI
     M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0,0);
+    M5.Lcd.print("Monitor Active");
 
+    pinMode(PIN_PPG, INPUT);
+    // Serial for debug
     Serial.begin(115200);
+    // CSV Header
     Serial.println("timestamp,RMSSD,D,V,F,A_disp,Amp,IBI");
     
-    // Initialize waveform buffer to middle
-    for(int i=0; i<240; i++) waveformBuffer[i] = 60;
+    // Init waveform buffer
+    for(int i=0; i<240; i++) waveformBuffer[i] = 92; // Center-ish
 }
 
 void loop() {
     M5.update();
     unsigned long now = millis();
 
-    // 1. PPG Sampling (100Hz)
+    // 1. PPG Sampling 
     if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
         lastSampleTime = now;
         processPPG();
-        // Store for drawing
-        waveformBuffer[waveIdx] = map(analogSignal, signalMin, signalMax, 135, 50); // Map to bottom half
-        if(waveformBuffer[waveIdx] < 50) waveformBuffer[waveIdx] = 50;
-        if(waveformBuffer[waveIdx] > 135) waveformBuffer[waveIdx] = 135;
+        // Map signal for LCD drawing (inverted Y logic: 0 is top)
+        // M5StickC Plus is 135x240 (rotated). height is 135.
+        // We use bottom half: 50 to 135.
+        // Signal: typically 0-4095. Center ~2000.
+        
+        // Simple auto-scaling map
+        int plotY = map(analogSignal, signalMin, signalMax, 130, 50); 
+        // Clamp
+        if(plotY < 50) plotY = 50;
+        if(plotY > 130) plotY = 130;
+        
+        waveformBuffer[waveIdx] = plotY;
         waveIdx = (waveIdx + 1) % 240;
     }
 
-    // 2. Metrics & Display Update (200ms)
+    // 2. Metrics & Display Update 
     if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
         lastDisplayTime = now;
         calculateMetrics();
@@ -139,42 +166,75 @@ void loop() {
 
 // --- Implementation ---
 
+// Helper to convert Heat color logic to RGB
+uint32_t getHeatColor(int value) {
+    // Value 0-255. 0=Blue/Cool, 255=Red/Hot
+    // Not critical, keeping it simple for now.
+    // User wants "Calm Green base, agitated Red points"
+    return 0;
+}
+
+void updateLEDs() {
+    // Base: Calm Green (Dim)
+    uint32_t baseColor = pixels.Color(0, 10, 0); 
+    // Active: Red (Bright)
+    uint32_t redColor = pixels.Color(150, 0, 0);
+
+    // 1. Fill background
+    for(int i=0; i<NUM_LEDS; i++) pixels.setPixelColor(i, baseColor);
+
+    // 2. Random red dots based on stress level 'areaDisp'
+    // areaDisp is roughly 0 to 56
+    int numActive = (int)areaDisp;
+    
+    // Create vector of indices to shuffle
+    std::vector<int> indices(NUM_LEDS);
+    std::iota(indices.begin(), indices.end(), 0);
+    
+    // Simple shuffle
+    for (int i = 0; i < numActive; i++) {
+        int r = i + random(NUM_LEDS - i);
+        std::swap(indices[i], indices[r]);
+        pixels.setPixelColor(indices[i], redColor);
+    }
+
+    pixels.show();
+}
+
 void processPPG() {
     analogSignal = analogRead(PIN_PPG);
-
-    // Filter extreme noise
-    if (analogSignal < 100 || analogSignal > 4000) return; // Ignore glitches if any
-
-    // Decay min/max (Reset if range collapses or drifts)
+    // Inverse safety check (connector loose?)
+    if (analogSignal < 1) analogSignal = 0;
+    
+    // Dynamic Range Adjuster
     if (signalMax > signalMin) {
-        signalMax -= 2; // Faster decay
-        signalMin += 2; // Faster rise
+        signalMax -= 2; // Decay
+        signalMin += 2; // Decay
     } else {
-        // Reset if invalid
+        // Reset if collapsed
         signalMax = analogSignal + 20;
         signalMin = analogSignal - 20;
     }
 
-    // Update with current signal
+    // Expand
     if (analogSignal < signalMin) signalMin = analogSignal;
     if (analogSignal > signalMax) signalMax = analogSignal;
     
     pulseAmplitude = signalMax - signalMin;
-    
-    // Threshold
     threshold = signalMin + (pulseAmplitude / 2);
 
     unsigned long now = millis();
     int ibi = 0;
     
-    // Only detect if we have significant amplitude (noise rejection)
-    if (pulseAmplitude > 100) { 
+    // Beat Detection Logic
+    if (pulseAmplitude > 100) { // Noise floor
         if (analogSignal > threshold && !pulseState) {
-            if (now - lastBeatTime > 250) { // Max 240 BPM
+            // Rising edge cross
+            if (now - lastBeatTime > 250) { // Debounce 250ms (240bpm max)
                 pulseState = true;
                 if (lastBeatTime > 0) {
                      ibi = now - lastBeatTime;
-                     if (ibi > 300 && ibi < 1500) { // 40-200 BPM
+                     if (ibi > 300 && ibi < 1500) { // 40-200 BPM valid
                          ibiBuffer.push_back({now, ibi});
                          lastIBI = ibi;
                      }
@@ -186,56 +246,58 @@ void processPPG() {
         }
     }
 
-    // Clean up
+    // Cleanup old IBIs
     while (!ibiBuffer.empty() && (now - ibiBuffer.front().timestamp > WINDOW_RMSSD_SEC * 1000)) {
         ibiBuffer.pop_front();
     }
 }
 
 void drawWaveform() {
-    // Clear top area only
+    // Info Area
     M5.Lcd.fillRect(0, 0, 240, 50, BLACK);
     
-    // Draw Stats
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.printf("HRV:%.1f", currentRMSSD);
+    M5.Lcd.setCursor(0, 0); M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.printf("HRV:%.0f", currentRMSSD); // Show ms directly
+    M5.Lcd.setCursor(120, 0); M5.Lcd.printf("S:%.2f", metricS);
     
-    M5.Lcd.setCursor(120, 0);
-    M5.Lcd.printf("F:%.2f", metricF);
+    M5.Lcd.setCursor(0, 20); M5.Lcd.printf("Amp:%d", pulseAmplitude);
+    M5.Lcd.setCursor(120, 20); M5.Lcd.printf("IBI:%d", lastIBI);
 
-    M5.Lcd.setCursor(0, 20);
-    M5.Lcd.printf("Amp:%d", pulseAmplitude);
-    M5.Lcd.setCursor(120, 20);
-    M5.Lcd.printf("IBI:%d", lastIBI);
-
-    // Pulse Indicator
-    if (millis() - lastBeatTime < 150) {
-         M5.Lcd.fillCircle(220, 25, 10, RED);
-    } else {
-         M5.Lcd.drawCircle(220, 25, 10, DARKGREY);
-    }
+    // Heartbeat Indicator
+    if (pulseState || (millis() - lastBeatTime < 100)) 
+        M5.Lcd.fillCircle(225, 25, 8, RED);
+    else 
+        M5.Lcd.drawCircle(225, 25, 8, DARKGREY);
     
-    // Draw Waveform (Clear only waveform area not efficient, but ok)
-    // We already draw black fill on top, waveform is bottom (50-135)
-    // Ideally we redraw just the line, but full refresh is flicker heavy.
-    // Simple approach: Clear bottom rect
+    // Waveform Area
+    // Clear the drawing area
+    // Optimized: clear by drawing black rect or just overwrite?
+    // Filling rect is safer for artifacts.
     M5.Lcd.fillRect(0, 50, 240, 85, BLACK);
+    
+    // Draw Buffer
+    // waveIdx is the "next write" position.
+    // We want to draw 0..239 such that waveIdx is the rightmost/newest pixel?
+    // Or just simple scan left-to-right.
+    // Simple scan: i loops 0..239. x = i. data = waveformBuffer[i].
+    // This creates a "scanline" effect.
+    // Scrolling effect: start at waveIdx.
+    
     for (int i = 0; i < 239; i++) {
-        int idx = (waveIdx + i) % 240;
-        int nextIdx = (waveIdx + i + 1) % 240;
-        M5.Lcd.drawLine(i, waveformBuffer[idx], i+1, waveformBuffer[nextIdx], GREEN);
+        int dataIdx = (waveIdx + i) % 240;
+        int nextDataIdx = (waveIdx + i + 1) % 240;
+        M5.Lcd.drawLine(i, waveformBuffer[dataIdx], i+1, waveformBuffer[nextDataIdx], GREEN);
     }
-    // Draw Threshold line (center of waveform area roughly)
-    M5.Lcd.drawFastHLine(0, 92, 240, DARKGREY); // 50 + 85/2
+    
+    // Baseline
+    M5.Lcd.drawFastHLine(0, 90, 240, 0x333333); 
 }
 
 float calculateRMSSD() {
-    if (ibiBuffer.size() < 2) return currentRMSSD; // Hold value
-    
+    if (ibiBuffer.size() < 2) return currentRMSSD; // No change
     float sumSqDiff = 0.0f;
     int count = 0;
+    // Iterate
     for (size_t i = 1; i < ibiBuffer.size(); i++) {
         float diff = (float)(ibiBuffer[i].value - ibiBuffer[i-1].value);
         sumSqDiff += diff * diff;
@@ -245,53 +307,49 @@ float calculateRMSSD() {
     return sqrt(sumSqDiff / count);
 }
 
-// ... Variance/Metrics (Same as before) ...
 float calculateVariance() {
     if (rmssdSecHistory.size() < 2) return 0.0f;
+    
+    // Mean
     float sum = 0.0f; for (float v : rmssdSecHistory) sum += v;
     float mean = sum / rmssdSecHistory.size();
+    
+    // Variance
     float sumSqDiff = 0.0f;
     for (float v : rmssdSecHistory) sumSqDiff += (v - mean) * (v - mean);
+    
     return sumSqDiff / rmssdSecHistory.size(); 
 }
 
 void calculateMetrics() {
     float newRMSSD = calculateRMSSD();
-    float rmssdSec = newRMSSD / 1000.0f;
-    float lastRmssdSec = currentRMSSD / 1000.0f;
+    float rmssdSec = newRMSSD / 1000.0f; // Seconds
+    float lastRmssdSec = currentRMSSD / 1000.0f; 
     
-    // D
+    // D: absolute difference of RMSSD (fluctuation of fluctuation)
     metricD = fabs(rmssdSec - lastRmssdSec);
     
-    // Variance Buffering
+    // Buffer for Variance of D or Variance of RMSSD? 
+    // Original prompt: "Calculate variance V of RMSSD"
     rmssdSecHistory.push_back(rmssdSec);
     if (rmssdSecHistory.size() > VAR_WINDOW) rmssdSecHistory.pop_front();
     
-    // V
     metricV = calculateVariance();
     
-    // F
+    // F: D + Lambda * V
     metricF = metricD + (LAMBDA * metricV);
     
-    // S & A
+    // S: 0.0 - 1.0 Stress Index
+    // S = 1 - e^(-K * F)
     metricS = 1.0f - exp(-K_PARAM * metricF);
-    areaA = floor(64.0f * metricS);
-    if (areaA > 56) areaA = 56;
+    
+    // Map S to LEDs (0-60 roughly)
+    // 64 LEDs. Keep some margin.
+    areaA = floor(60.0f * metricS);
+    if (areaA > 64) areaA = 64; 
+    
+    // Smooth Display
     areaDisp = (ALPHA * (float)areaA) + ((1.0f - ALPHA) * areaDisp);
     
-    currentRMSSD = newRMSSD; // Update last
-}
-
-void updateLEDs() {
-    fill_solid(leds, NUM_LEDS, CHSV(96, 255, 60)); // Greenish (HSV 96/255 is ~135deg)
-    
-    int numActive = (int)areaDisp;
-    std::vector<int> indices(NUM_LEDS);
-    std::iota(indices.begin(), indices.end(), 0);
-    for (int i = 0; i < numActive; i++) {
-        int r = i + random(NUM_LEDS - i);
-        std::swap(indices[i], indices[r]);
-        leds[indices[i]] = CHSV(0, 255, 100); // Red
-    }
-    FastLED.show();
+    currentRMSSD = newRMSSD; 
 }
