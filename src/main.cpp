@@ -14,8 +14,8 @@
 #define PIN_PPG 26      // Analog Input for Pulse Sensor (G26 - Header)
 // Unit Puzzle usually uses the White wire for Data Input on Port B/C devices.
 // On M5StickC Plus Grove Port (Port A/Red): White wire is G32, Yellow is G33.
-// We will drive G32. If this fails, user can try changing this to 33.
-#define PIN_LED 32      
+// Trying G33 (Yellow) as G32 (White) did not work.
+#define PIN_LED 33      
 #define NUM_LEDS 64     // 8x8 Matrix
 
 // --- Algorithm Constants ---
