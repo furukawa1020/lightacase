@@ -7,7 +7,7 @@
 
 // --- Hardware Configuration ---
 #define PIN_PPG 26      // Analog Input for Pulse Sensor (G26 - Header)
-#define PIN_LED 32      // GPIO for LED Matrix (G32 - Grove Port Data)
+#define PIN_LED 33      // GPIO for LED Matrix (G33 - Grove Yellow Wire)
 #define NUM_LEDS 64     // 8x8 Matrix
 
 // --- Algorithm Constants ---
@@ -71,18 +71,33 @@ void setup() {
     M5.Lcd.setTextSize(2);
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.print("Init LED...");
+    
+    // Safety delay
+    delay(100);
 
     pinMode(PIN_PPG, INPUT);
     
-    // Init FastLED - Try SK6812 which is common for M5 Units, fallback to WS2812
-    FastLED.addLeds<SK6812, PIN_LED, GRB>(leds, NUM_LEDS); 
+    // Explicitly set LED pin to Output and Low before Init
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, LOW);
+
+    // Init FastLED 
+    // M5StickC Plus Grove: G32 (Yellow Line) is standard for Signal.
+    // Use WS2812B definition as it's robust for SK6812 too usually.
+    FastLED.addLeds<WS2812, PIN_LED, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
     FastLED.setBrightness(40); 
     
     // LED Test: Red, Green, Blue Flash
-    fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show(); delay(500);
-    fill_solid(leds, NUM_LEDS, CRGB::Green); FastLED.show(); delay(500);
-    fill_solid(leds, NUM_LEDS, CRGB::Blue); FastLED.show(); delay(500);
+    M5.Lcd.print("\nTEST: R");
+    fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show(); delay(300);
+    M5.Lcd.print("G");
+    fill_solid(leds, NUM_LEDS, CRGB::Green); FastLED.show(); delay(300);
+    M5.Lcd.print("B");
+    fill_solid(leds, NUM_LEDS, CRGB::Blue); FastLED.show(); delay(300);
     FastLED.clear(); FastLED.show();
+    M5.Lcd.print(" Done");
+    delay(500);
+    M5.Lcd.fillScreen(BLACK);
 
     Serial.begin(115200);
     Serial.println("timestamp,RMSSD,D,V,F,A_disp,Amp,IBI");
