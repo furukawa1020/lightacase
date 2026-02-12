@@ -16,7 +16,7 @@
 // --- Config ---
 const float LAMBDA = 2.0f;
 const float K_PARAM = 6.5f; 
-const float ALPHA = 0.4f;
+const float ALPHA = 0.4f;     // Inertia filter
 const int WINDOW_RMSSD_SEC = 15;
 const int VAR_WINDOW = 5;
 
@@ -27,7 +27,7 @@ const unsigned long DISPLAY_INTERVAL_MS = 200;
 // --- Globals ---
 Adafruit_NeoPixel pixels(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
 
-// We store the colors here to draw them on the screen as well
+// We store the colors here
 std::vector<uint32_t> virtualLeds(NUM_LEDS, 0);
 
 unsigned long lastSampleTime = 0;
@@ -57,8 +57,10 @@ float metricD = 0.0f;
 float metricV = 0.0f;
 float metricF = 0.0f;
 float metricS = 0.0f;
-int areaA = 0;
-float areaDisp = 0.0f;
+
+// Area Control
+int targetAreaA = 0;      // calculated A(t)
+float currentAreaDisp = 0.0f; // smoothed A_disp(t)
 
 // Display Config
 #define GRAPH_WIDTH 150
@@ -85,10 +87,6 @@ void setup() {
     M5.begin();
     M5.Lcd.setRotation(3);
     M5.Lcd.setTextSize(2);
-    
-    // External LED Init
-    // Try to ensure Power is ON for Grove
-    // M5.Axp.SetLDO2(true); // Display/Peripherals? M5.begin handles it.
     
     pixels.begin();
     pixels.setBrightness(20);
@@ -119,11 +117,7 @@ void loop() {
         lastSampleTime = now;
         processPPG();
         
-        // Map to Graph Height
-        // Inverted: 0 is Top.
-        // We want range approx 30 to 135. (Leave top 30 for text)
         int plotY = map(analogSignal, signalMin, signalMax, 130, 40); 
-        
         if(plotY < 40) plotY = 40;
         if(plotY > 130) plotY = 130;
         
@@ -132,26 +126,36 @@ void loop() {
     }
 
     // 2. Display (5Hz)
+    // Runs inertia filter and rendering
     if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
         lastDisplayTime = now;
-        calculateMetrics();
-        updateLEDs(); // Calculates colors
-        
-        drawWaveform();      // Left Side
-        drawVirtualMatrix(); // Right Side
+        updateLEDs(); 
+        drawWaveform();      
+        drawVirtualMatrix(); 
     }
 }
 
 void updateLEDs() {
-    // Colors
-    uint32_t cBase = pixels.Color(0, 10, 0);   // Dim Green
-    uint32_t cRed  = pixels.Color(150, 0, 0); // Bright Red
+    // Inertia Filter Step (200ms)
+    // A_disp(t) = a * A(t) + (1-a) * A_disp(t-1)
+    currentAreaDisp = (ALPHA * (float)targetAreaA) + ((1.0f - ALPHA) * currentAreaDisp);
+    
+    int numActive = (int)currentAreaDisp;
+    // Safety clamp (Display can only do 64)
+    if (numActive > 64) numActive = 64;
 
-    // Fill Base
+    // Colors
+    // Green: Calm. HSV(120, low sat, low val) -> approximated
+    uint32_t cBase = pixels.Color(0, 10, 0);   
+    
+    // Red: HSV(0, 80%, 80%) -> R=204, G=41, B=41 ( approx for WS2812)
+    // M5 "Red" (255,0,0) is fine but let's make it slightly less saturated as requested?
+    // User: HSV(0, 80%, 80%) = approx RGB(204, 40, 40)
+    uint32_t cRed  = pixels.Color(200, 40, 40); 
+
     std::fill(virtualLeds.begin(), virtualLeds.end(), cBase);
 
-    // Random Red Dots based on areaDisp
-    int numActive = (int)areaDisp;
+    // Random Red Dots
     std::vector<int> indices(NUM_LEDS);
     std::iota(indices.begin(), indices.end(), 0);
     
@@ -161,25 +165,21 @@ void updateLEDs() {
         virtualLeds[indices[i]] = cRed;
     }
 
-    // Output to External LED
     for(int i=0; i<NUM_LEDS; i++) pixels.setPixelColor(i, virtualLeds[i]);
     pixels.show();
 }
 
 void drawVirtualMatrix() {
-    // 8x8 Grid
     for(int y=0; y<8; y++) {
         for(int x=0; x<8; x++) {
-            int i = (y*8) + x; // Row Major
+            int i = (y*8) + x; 
             uint32_t c = virtualLeds[i];
             
-            // Convert RGB32 to RGB565 for LCD
             uint8_t r = (c >> 16) & 0xFF;
             uint8_t g = (c >> 8) & 0xFF;
             uint8_t b = c & 0xFF;
             uint16_t color565 = M5.Lcd.color565(r, g, b);
             
-            // Draw Cell
             M5.Lcd.fillRect(MATRIX_X_OFFSET + (x*CELL_SIZE), 
                             MATRIX_Y_OFFSET + (y*CELL_SIZE), 
                             CELL_SIZE-1, CELL_SIZE-1, 
@@ -189,39 +189,33 @@ void drawVirtualMatrix() {
 }
 
 void drawWaveform() {
-    // Clear Info Area (Top Left)
     M5.Lcd.fillRect(0, 0, GRAPH_WIDTH, 35, BLACK);
     
-    // Stats
     M5.Lcd.setTextSize(1); M5.Lcd.setTextColor(WHITE);
     M5.Lcd.setCursor(0, 5); 
     M5.Lcd.printf("HRV:%.0f ms", currentRMSSD);
     
     M5.Lcd.setCursor(0, 15); 
-    M5.Lcd.printf("S:%.2f", metricS);
+    M5.Lcd.printf("F:%.2f", metricF); // Show F(t)
 
     M5.Lcd.setCursor(80, 5); 
-    M5.Lcd.printf("IBI:%d", lastIBI);
+    M5.Lcd.printf("Area:%d", (int)currentAreaDisp);
     M5.Lcd.setCursor(80, 15); 
     M5.Lcd.printf("Amp:%d", pulseAmplitude);
 
-    // Heartbeat Dot
     if (pulseState || (millis() - lastBeatTime < 100)) 
         M5.Lcd.fillCircle(140, 10, 5, RED);
     else 
         M5.Lcd.drawCircle(140, 10, 5, DARKGREY);
 
-    // Clear Wave Area (Bottom Left)
     M5.Lcd.fillRect(0, 36, GRAPH_WIDTH, 135-36, BLACK);
     
-    // Draw Graph
     for (int i = 0; i < GRAPH_WIDTH - 1; i++) {
         int idx = (waveIdx + i) % GRAPH_WIDTH;
         int nextIdx = (waveIdx + i + 1) % GRAPH_WIDTH;
         M5.Lcd.drawLine(i, waveformBuffer[idx], i+1, waveformBuffer[nextIdx], GREEN);
     }
     
-    // Divider Line
     M5.Lcd.drawFastVLine(GRAPH_WIDTH + 2, 0, 135, WHITE);
 }
 
@@ -255,6 +249,10 @@ void processPPG() {
                      if (ibi > 300 && ibi < 1500) { 
                          ibiBuffer.push_back({now, ibi});
                          lastIBI = ibi;
+                         
+                         // *** CRITICAL CHANGE ***
+                         // Update metrics ON BEAT event to capture the 'Jump'
+                         calculateMetrics(); 
                      }
                 }
                 lastBeatTime = now;
@@ -296,17 +294,31 @@ void calculateMetrics() {
     float rmssdSec = newRMSSD / 1000.0f; 
     float lastRmssdSec = currentRMSSD / 1000.0f; 
     
+    // D: absolute difference of RMSSD (fluctuation of fluctuation)
     metricD = fabs(rmssdSec - lastRmssdSec);
     
     rmssdSecHistory.push_back(rmssdSec);
     if (rmssdSecHistory.size() > VAR_WINDOW) rmssdSecHistory.pop_front();
     
     metricV = calculateVariance();
+    
+    // F: D + Lambda * V
     metricF = metricD + (LAMBDA * metricV);
+    
+    // S: 0.0 - 1.0 Stress Index
+    // S = 1 - e^(-K * F)
     metricS = 1.0f - exp(-K_PARAM * metricF);
     
-    areaA = floor(60.0f * metricS);
-    if (areaA > 64) areaA = 64; 
-    areaDisp = (ALPHA * (float)areaA) + ((1.0f - ALPHA) * areaDisp);
+    // A(t) = floor(64 * s(t))
+    // User requested max 56
+    int rawArea = floor(64.0f * metricS);
+    if (rawArea > 56) rawArea = 56;
+    
+    // Update target for the inertia filter
+    targetAreaA = rawArea;
+    
     currentRMSSD = newRMSSD; 
+    
+    Serial.printf("%lu,%.4f,%.4f,%.6f,%.4f,%.0f,%d,%d\n", 
+        millis(), rmssdSec, metricD, metricV, metricF, currentAreaDisp, pulseAmplitude, lastIBI);
 }
