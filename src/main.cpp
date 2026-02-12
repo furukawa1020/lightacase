@@ -12,7 +12,7 @@
 
 // --- Algorithm Constants ---
 const float LAMBDA = 2.0f;
-const float K_PARAM = 6.5f; // User said 5-8
+const float K_PARAM = 6.5f; 
 const float ALPHA = 0.4f;
 const int WINDOW_RMSSD_SEC = 15;
 const int VAR_WINDOW = 5;
@@ -28,24 +28,24 @@ unsigned long lastDisplayTime = 0;
 
 // PPG Processing
 int analogSignal = 0;
-int threshold = 2048; // Dynamic threshold
+int threshold = 2048; 
 int signalMin = 4095;
 int signalMax = 0;
 unsigned long lastBeatTime = 0;
 bool pulseState = false;
+int lastIBI = 0;        // Debug
+int pulseAmplitude = 0; // Debug
 
 // Metrics Buffers
 struct IBIEntry {
     unsigned long timestamp;
     int value; // ms
 };
-std::deque<IBIEntry> ibiBuffer; // Stores IBIs for RMSSD window
-std::deque<float> rmssdHistory; // Stores RMSSD values for Variance
-std::deque<float> rmssdSecHistory; // Stores RMSSD values (seconds) for Variance Calculation
+std::deque<IBIEntry> ibiBuffer; 
+std::deque<float> rmssdSecHistory; 
 
 // Calculated Metrics
 float currentRMSSD = 0.0f;
-float lastRMSSD = 0.0f;
 float metricD = 0.0f;
 float metricV = 0.0f;
 float metricF = 0.0f;
@@ -59,113 +59,161 @@ void calculateMetrics();
 void updateLEDs();
 float calculateRMSSD();
 float calculateVariance();
+void drawWaveform();
+
+// Graphing
+int waveformBuffer[240]; // For LCD width
+int waveIdx = 0;
 
 void setup() {
     M5.begin();
     M5.Lcd.setRotation(3);
     M5.Lcd.setTextSize(2);
-    M5.Lcd.print("AII Monitor\nInit...");
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.print("Init LED...");
 
     pinMode(PIN_PPG, INPUT);
     
-    // Init FastLED
-    FastLED.addLeds<WS2812, PIN_LED, GRB>(leds, NUM_LEDS);
-    FastLED.setBrightness(100); // 40% of 255 approx
-    FastLED.clear();
-    FastLED.show();
+    // Init FastLED - Try SK6812 which is common for M5 Units, fallback to WS2812
+    FastLED.addLeds<SK6812, PIN_LED, GRB>(leds, NUM_LEDS); 
+    FastLED.setBrightness(40); 
+    
+    // LED Test: Red, Green, Blue Flash
+    fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show(); delay(500);
+    fill_solid(leds, NUM_LEDS, CRGB::Green); FastLED.show(); delay(500);
+    fill_solid(leds, NUM_LEDS, CRGB::Blue); FastLED.show(); delay(500);
+    FastLED.clear(); FastLED.show();
 
     Serial.begin(115200);
-    // CSV Header
-    Serial.println("timestamp,RMSSD,D,V,F,A_disp");
+    Serial.println("timestamp,RMSSD,D,V,F,A_disp,Amp,IBI");
+    
+    // Initialize waveform buffer to middle
+    for(int i=0; i<240; i++) waveformBuffer[i] = 60;
 }
 
 void loop() {
     M5.update();
     unsigned long now = millis();
 
-    // 1. PPG Sampling & Feature Extraction (100Hz)
+    // 1. PPG Sampling (100Hz)
     if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
         lastSampleTime = now;
         processPPG();
+        // Store for drawing
+        waveformBuffer[waveIdx] = map(analogSignal, signalMin, signalMax, 135, 50); // Map to bottom half
+        if(waveformBuffer[waveIdx] < 50) waveformBuffer[waveIdx] = 50;
+        if(waveformBuffer[waveIdx] > 135) waveformBuffer[waveIdx] = 135;
+        waveIdx = (waveIdx + 1) % 240;
     }
 
-    // 2. Metrics & Display Update (5Hz / 200ms)
+    // 2. Metrics & Display Update (200ms)
     if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
         lastDisplayTime = now;
         calculateMetrics();
         updateLEDs();
+        drawWaveform();
         
-        // Log to CSV
-        Serial.printf("%lu,%.4f,%.4f,%.6f,%.4f,%.0f\n", 
-            now, currentRMSSD/1000.0f, metricD, metricV, metricF, areaDisp);
-            
-        // Optional: Debug on LCD
-        M5.Lcd.setCursor(0, 0);
-        M5.Lcd.fillRect(0, 0, 240, 135, BLACK);
-        // Show params
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.printf("HRV:%.0fms\n", currentRMSSD);
-        M5.Lcd.printf("F:%.3f\n", metricF);
-        M5.Lcd.printf("A:%d", (int)areaDisp);
-        
-        // Visual indicator of pulse
-        if (now - lastBeatTime < 150) {
-             M5.Lcd.fillCircle(200, 30, 10, RED);
-        }
+        Serial.printf("%lu,%.4f,%.4f,%.6f,%.4f,%.0f,%d,%d\n", 
+            now, currentRMSSD/1000.0f, metricD, metricV, metricF, areaDisp, pulseAmplitude, lastIBI);
     }
 }
 
 // --- Implementation ---
 
-// Simple Dynamic Threshold Pulse Detector
 void processPPG() {
     analogSignal = analogRead(PIN_PPG);
 
-    // Dynamic Range Adjustment (decay over time)
+    // Filter extreme noise
+    if (analogSignal < 100 || analogSignal > 4000) return; // Ignore glitches if any
+
+    // Decay min/max (Reset if range collapses or drifts)
+    if (signalMax > signalMin) {
+        signalMax -= 2; // Faster decay
+        signalMin += 2; // Faster rise
+    } else {
+        // Reset if invalid
+        signalMax = analogSignal + 20;
+        signalMin = analogSignal - 20;
+    }
+
+    // Update with current signal
     if (analogSignal < signalMin) signalMin = analogSignal;
     if (analogSignal > signalMax) signalMax = analogSignal;
     
-    // Quickly adapt to signal range, slowly decay limits to allow tracking
-    // Decay factor tuned for 100Hz loop
-    // If signal amplitude changes, we need threshold to follow.
-    if (signalMax > 0) signalMax -= 1;     // Decay max
-    if (signalMin < 4095) signalMin += 1;  // Rise min
-
-    // Threshold at 50%
-    threshold = signalMin + (signalMax - signalMin) / 2;
+    pulseAmplitude = signalMax - signalMin;
+    
+    // Threshold
+    threshold = signalMin + (pulseAmplitude / 2);
 
     unsigned long now = millis();
     int ibi = 0;
-
-    // Pulse Rising Edge Detection
-    if (analogSignal > threshold && !pulseState) {
-        // Refractory period: Avoid detecting dicrotic notch or noise as beat
-        // 250ms = Max 240 BPM.
-        if (now - lastBeatTime > 250) {
-            pulseState = true;
-            if (lastBeatTime > 0) {
-                 ibi = now - lastBeatTime;
-                 // Valid biological range: 30 BPM (2000ms) to 200 BPM (300ms)
-                 if (ibi > 300 && ibi < 2000) {
-                     // Add to buffer
-                     ibiBuffer.push_back({now, ibi});
-                 }
+    
+    // Only detect if we have significant amplitude (noise rejection)
+    if (pulseAmplitude > 100) { 
+        if (analogSignal > threshold && !pulseState) {
+            if (now - lastBeatTime > 250) { // Max 240 BPM
+                pulseState = true;
+                if (lastBeatTime > 0) {
+                     ibi = now - lastBeatTime;
+                     if (ibi > 300 && ibi < 1500) { // 40-200 BPM
+                         ibiBuffer.push_back({now, ibi});
+                         lastIBI = ibi;
+                     }
+                }
+                lastBeatTime = now;
             }
-            lastBeatTime = now;
+        } else if (analogSignal < threshold && pulseState) {
+            pulseState = false;
         }
-    } else if (analogSignal < threshold && pulseState) {
-        pulseState = false;
     }
 
-    // Clean up old IBIs (older than 15s)
+    // Clean up
     while (!ibiBuffer.empty() && (now - ibiBuffer.front().timestamp > WINDOW_RMSSD_SEC * 1000)) {
         ibiBuffer.pop_front();
     }
 }
 
+void drawWaveform() {
+    // Clear top area only
+    M5.Lcd.fillRect(0, 0, 240, 50, BLACK);
+    
+    // Draw Stats
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.printf("HRV:%.1f", currentRMSSD);
+    
+    M5.Lcd.setCursor(120, 0);
+    M5.Lcd.printf("F:%.2f", metricF);
+
+    M5.Lcd.setCursor(0, 20);
+    M5.Lcd.printf("Amp:%d", pulseAmplitude);
+    M5.Lcd.setCursor(120, 20);
+    M5.Lcd.printf("IBI:%d", lastIBI);
+
+    // Pulse Indicator
+    if (millis() - lastBeatTime < 150) {
+         M5.Lcd.fillCircle(220, 25, 10, RED);
+    } else {
+         M5.Lcd.drawCircle(220, 25, 10, DARKGREY);
+    }
+    
+    // Draw Waveform (Clear only waveform area not efficient, but ok)
+    // We already draw black fill on top, waveform is bottom (50-135)
+    // Ideally we redraw just the line, but full refresh is flicker heavy.
+    // Simple approach: Clear bottom rect
+    M5.Lcd.fillRect(0, 50, 240, 85, BLACK);
+    for (int i = 0; i < 239; i++) {
+        int idx = (waveIdx + i) % 240;
+        int nextIdx = (waveIdx + i + 1) % 240;
+        M5.Lcd.drawLine(i, waveformBuffer[idx], i+1, waveformBuffer[nextIdx], GREEN);
+    }
+    // Draw Threshold line (center of waveform area roughly)
+    M5.Lcd.drawFastHLine(0, 92, 240, DARKGREY); // 50 + 85/2
+}
+
 float calculateRMSSD() {
-    // If not enough data, return previous or 0
-    if (ibiBuffer.size() < 2) return currentRMSSD;
+    if (ibiBuffer.size() < 2) return currentRMSSD; // Hold value
     
     float sumSqDiff = 0.0f;
     int count = 0;
@@ -178,83 +226,53 @@ float calculateRMSSD() {
     return sqrt(sumSqDiff / count);
 }
 
+// ... Variance/Metrics (Same as before) ...
 float calculateVariance() {
     if (rmssdSecHistory.size() < 2) return 0.0f;
-
-    float sum = 0.0f;
-    for (float v : rmssdSecHistory) sum += v;
+    float sum = 0.0f; for (float v : rmssdSecHistory) sum += v;
     float mean = sum / rmssdSecHistory.size();
-
     float sumSqDiff = 0.0f;
-    for (float v : rmssdSecHistory) {
-        sumSqDiff += (v - mean) * (v - mean);
-    }
-    // Population or Sample? Spec moving variance usually population for physics/window
-    // Using population variance for "Moving Variance"
+    for (float v : rmssdSecHistory) sumSqDiff += (v - mean) * (v - mean);
     return sumSqDiff / rmssdSecHistory.size(); 
 }
 
 void calculateMetrics() {
-    // 1. Current RMSSD (ms)
     float newRMSSD = calculateRMSSD();
-    
-    // Store last RMSSD (ms) for D calculation? 
-    // Spec: D(t) = |R(t) - R(t-1)|. 
-    // R(t) is current RMSSD. R(t-1) is RMSSD from PREVIOUS TIME STEP (200ms ago)
-    // We update lastRMSSD at end of function.
-    
-    // Convert to Seconds for Formula consistency (small k implies input ~0-1 range)
     float rmssdSec = newRMSSD / 1000.0f;
-    float lastRmssdSec = currentRMSSD / 1000.0f; // currentRMSSD holds R(t-1) until update
+    float lastRmssdSec = currentRMSSD / 1000.0f;
     
-    // 2. Diff (D) in Seconds
-    metricD = fabs(rmssdSec - lastRmssdSec); // Absolute difference
-
-    // 3. Update Variance History (Seconds)
+    // D
+    metricD = fabs(rmssdSec - lastRmssdSec);
+    
+    // Variance Buffering
     rmssdSecHistory.push_back(rmssdSec);
-    if (rmssdSecHistory.size() > VAR_WINDOW) {
-        rmssdSecHistory.pop_front();
-    }
-
-    // 4. Variance (V) in Seconds^2
+    if (rmssdSecHistory.size() > VAR_WINDOW) rmssdSecHistory.pop_front();
+    
+    // V
     metricV = calculateVariance();
-
-    // 5. Hybrid F
+    
+    // F
     metricF = metricD + (LAMBDA * metricV);
-
-    // 6. Non-linear s(t)
-    metricS = 1.0f - exp(-K_PARAM * metricF); 
-
-    // 7. Area A(t)
+    
+    // S & A
+    metricS = 1.0f - exp(-K_PARAM * metricF);
     areaA = floor(64.0f * metricS);
-    if (areaA > 56) areaA = 56; // Max Limit 56
-
-    // 8. Inertia Filter (Display Area)
+    if (areaA > 56) areaA = 56;
     areaDisp = (ALPHA * (float)areaA) + ((1.0f - ALPHA) * areaDisp);
-
-    // Update global current for next loop
-    currentRMSSD = newRMSSD; // Now R(t) becomes R(t-1) for next call
+    
+    currentRMSSD = newRMSSD; // Update last
 }
 
 void updateLEDs() {
-    // Base Color: Calm Green - HSV(85, 204, 100) (approx 120deg)
-    fill_solid(leds, NUM_LEDS, CHSV(85, 204, 50)); 
-
-    // Active Color: Red - HSV(0, 204, 204) (approx 80% sat/val)
+    fill_solid(leds, NUM_LEDS, CHSV(96, 255, 60)); // Greenish (HSV 96/255 is ~135deg)
     
     int numActive = (int)areaDisp;
-    if (numActive < 0) numActive = 0;
-    if (numActive > 56) numActive = 56;
-
-    // Randomize Red Locations
     std::vector<int> indices(NUM_LEDS);
     std::iota(indices.begin(), indices.end(), 0);
-    
     for (int i = 0; i < numActive; i++) {
         int r = i + random(NUM_LEDS - i);
         std::swap(indices[i], indices[r]);
-        leds[indices[i]] = CHSV(0, 204, 204);
+        leds[indices[i]] = CHSV(0, 255, 100); // Red
     }
-
     FastLED.show();
 }
